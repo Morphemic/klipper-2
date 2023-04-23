@@ -6,6 +6,41 @@
 import math, logging
 import stepper, chelper
 
+class ExtruderSmoother:
+    def __init__(self, config, pa_model):
+        self.smooth_time = config.getfloat(
+                'pressure_advance_smooth_time', 0.040, above=0., maxval=.200)
+        # A 4-th order smoothing function that goes to 0 together with
+        # its derivative at the ends of the smoothing interval
+        self.a = [15./8., 0., -15., 0., 30.]
+        self.pa_model = pa_model
+        self.axes = ['x', 'y', 'z']
+    def update(self, gcmd):
+        self.smooth_time = gcmd.get_float('SMOOTH_TIME', self.smooth_time)
+    def update_pa_model(self, pa_model):
+        self.pa_model = pa_model
+    def enable_axis(self, axis):
+        if axis not in self.axes:
+            self.axes.append(axis)
+    def disable_axis(self, axis):
+        if axis in self.axes:
+            self.axes.remove(axis)
+    def update_extruder_kinematics(self, extruder_sk):
+        ffi_main, ffi_lib = chelper.get_ffi()
+        n = len(self.a)
+        success = True
+        smooth_time = self.smooth_time if self.pa_model.enabled() else 0.
+        for axis in self.axes:
+            if not ffi_lib.extruder_set_smoothing_params(
+                    extruder_sk, axis.encode(), n, self.a,
+                    smooth_time) == 0:
+                success = False
+        return success
+    def get_status(self, eventtime):
+        return {'pressure_advance_smooth_time': self.smooth_time}
+    def get_msg(self):
+        return "pressure_advance_smooth_time: %.6f" % (self.smooth_time,)
+
 class PALinearModel:
     name = 'linear'
     def __init__(self, config=None):
@@ -70,8 +105,7 @@ class PANonLinearModel:
                     self.linear_offset,
                     self.linearization_velocity))
     def get_func(self):
-        ffi_main, ffi_lib = chelper.get_ffi()
-        return ffi_lib.pressure_advance_tanh_model_func
+        return None
 
 class PATanhModel(PANonLinearModel):
     name = 'tanh'
@@ -99,8 +133,7 @@ class ExtruderStepper:
         self.pa_model = config.getchoice('pressure_advance_model',
                                          self.pa_models,
                                          PALinearModel.name)(config)
-        self.pressure_advance_smooth_time = config.getfloat(
-                'pressure_advance_smooth_time', 0.040, above=0., maxval=.200)
+        self.smoother = ExtruderSmoother(config, self.pa_model)
         self.pressure_advance_time_offset = config.getfloat(
                 'pressure_advance_time_offset', 0.0, minval=-0.2, maxval=0.2)
         # Setup stepper
@@ -140,14 +173,14 @@ class ExtruderStepper:
         self.toolhead = self.printer.lookup_object('toolhead')
         self.toolhead.register_step_generator(self.stepper.generate_steps)
         self._update_pressure_advance(self.pa_model,
-                                      self.pressure_advance_smooth_time,
                                       self.pressure_advance_time_offset)
+        self.smoother.update_extruder_kinematics(self.sk_extruder)
     def get_status(self, eventtime):
         sts = {'pressure_advance_model': self.pa_model.name,
-               'smooth_time': self.pressure_advance_smooth_time,
                'time_offset': self.pressure_advance_time_offset,
                'motion_queue': self.motion_queue}
         sts.update(self.pa_model.get_status(eventtime))
+        sts.update(self.smoother.get_status(eventtime))
         return sts
     def find_past_position(self, print_time):
         mcu_pos = self.stepper.get_past_mcu_position(print_time)
@@ -167,7 +200,7 @@ class ExtruderStepper:
         extruder.link_extruder_stepper(self)
         self.motion_queue = extruder_name
         self.extruder = extruder
-    def _update_pressure_advance(self, pa_model, smooth_time, time_offset):
+    def _update_pressure_advance(self, pa_model, time_offset):
         self.toolhead.flush_step_generation()
         ffi_main, ffi_lib = chelper.get_ffi()
         old_delay = ffi_lib.extruder_get_step_gen_window(self.sk_extruder)
@@ -177,28 +210,35 @@ class ExtruderStepper:
                                                              pa_func)
         pa_params = pa_model.get_pa_params()
         ffi_lib.extruder_set_pressure_advance(
-                self.sk_extruder, len(pa_params), pa_params,
-                smooth_time, time_offset)
+                self.sk_extruder, len(pa_params), pa_params, time_offset)
+        self.smoother.update_pa_model(pa_model)
+        self.smoother.update_extruder_kinematics(self.sk_extruder)
         new_delay = ffi_lib.extruder_get_step_gen_window(self.sk_extruder)
         if old_delay != new_delay:
             self.toolhead.note_step_generation_scan_time(new_delay, old_delay)
         self.pa_model = pa_model
-        self.pressure_advance_smooth_time = smooth_time
         self.pressure_advance_time_offset = time_offset
     def update_input_shaping(self, shapers):
         ffi_main, ffi_lib = chelper.get_ffi()
         old_delay = ffi_lib.extruder_get_step_gen_window(self.sk_extruder)
         failed_shapers = []
-        for shaper in self.shapers:
+        for shaper in shapers:
             if not shaper.update_extruder_kinematics(self.sk_extruder):
                 failed_shapers.append(shaper)
+            # Pressure advance requires extruder smoothing, make sure that
+            # some smoothing is enabled
+            if shaper.is_smoothing() and shaper.is_enabled():
+                self.smoother.disable_axis(shaper.get_axis())
+            elif not shaper.is_smoothing() or not shaper.is_enabled():
+                self.smoother.enable_axis(shaper.get_axis())
+        self.smoother.update_extruder_kinematics(self.sk_extruder)
         new_delay = ffi_lib.extruder_get_step_gen_window(self.sk_extruder)
         if old_delay != new_delay:
             self.toolhead.note_step_generation_scan_time(new_delay, old_delay)
         return failed_shapers
     cmd_SET_PRESSURE_ADVANCE_help = "Set pressure advance parameters"
     def cmd_default_SET_PRESSURE_ADVANCE(self, gcmd):
-        extruder = self.printer.lookup_object('toolhead').get_extruder()
+        extruder = self.toolhead.get_extruder()
         extruder_steppers = extruder.get_extruder_steppers()
         if not extruder_steppers:
             raise gcmd.error("Active extruder does not have a stepper")
@@ -215,18 +255,16 @@ class ExtruderStepper:
         if pa_model_name != self.pa_model.name:
             pa_model = self.pa_models[pa_model_name]()
         pa_model.update(gcmd)
-        smooth_time = gcmd.get_float('SMOOTH_TIME',
-                                     self.pressure_advance_smooth_time,
-                                     minval=0., maxval=.200)
+        self.smoother.update(gcmd)
         time_offset = gcmd.get_float('TIME_OFFSET',
                                      self.pressure_advance_time_offset,
                                      minval=-0.2, maxval=0.2)
-        self._update_pressure_advance(pa_model, smooth_time, time_offset)
+        self._update_pressure_advance(pa_model, time_offset)
         msg = ("pressure_advance_model: %s\n" % (pa_model.name,) +
-               pa_model.get_msg() +
-               "\npressure_advance_smooth_time: %.6f"
+               pa_model.get_msg() + "\n" +
+               self.smoother.get_msg() +
                "\npressure_advance_time_offset: %.6f"
-               % (smooth_time, time_offset))
+               % (time_offset,))
         self.printer.set_rollover_info(self.name, "%s: %s" % (self.name, msg))
         gcmd.respond_info(msg, log=False)
     cmd_SET_E_ROTATION_DISTANCE_help = "Set extruder rotation distance"
@@ -240,8 +278,7 @@ class ExtruderStepper:
             if rotation_dist < 0.:
                 next_invert_dir = not orig_invert_dir
                 rotation_dist = -rotation_dist
-            toolhead = self.printer.lookup_object('toolhead')
-            toolhead.flush_step_generation()
+            self.toolhead.flush_step_generation()
             self.stepper.set_rotation_distance(rotation_dist)
             self.stepper.set_dir_inverted(next_invert_dir)
         else:
@@ -261,8 +298,7 @@ class ExtruderStepper:
     def cmd_SET_E_STEP_DISTANCE(self, gcmd):
         step_dist = gcmd.get_float('DISTANCE', None, above=0.)
         if step_dist is not None:
-            toolhead = self.printer.lookup_object('toolhead')
-            toolhead.flush_step_generation()
+            self.toolhead.flush_step_generation()
             rd, steps_per_rotation = self.stepper.get_rotation_distance()
             self.stepper.set_rotation_distance(step_dist * steps_per_rotation)
         else:
